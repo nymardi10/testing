@@ -1,121 +1,210 @@
 import boto3
-import time
-import sys
-import random
 
-EC2_RESOURCE = boto3.resource('ec2',region_name='us-east-1')
-EC2_CLIENT = boto3.client('ec2',region_name='us-east-1')
-INSTANCE_ID = input('Enter Instance Id - Format i-..... :')
+ec2 = boto3.client('ec2')
+instance_stop_waiter = ec2.get_waiter('instance_stopped')
+snapshot_create_waiter = ec2.get_waiter('snapshot_completed')
+volume_waiter = ec2.get_waiter('volume_available')
 
-def find_volumes(instance):
-    ec2 = boto3.resource('ec2', region_name="us-east-1")
-    response_instance = ec2.Instance(instance)
-    volumes = response_instance.volumes.all()
-    response = []
-    for item in volumes:
-        response.append(
-            {"volume": item.id, "type": item.volume_type, "az": response_instance.placement['AvailabilityZone'], 'device': item.attachments[0]['Device']})
-    return response
 
-def stop_instances(instance_id):
-    state = EC2_CLIENT.stop_instances(
-            InstanceIds = [instance_id]
+def stop_instance(id):
+    response = ec2.stop_instances(InstanceIds=[id])
+    return
+
+
+def create_snapshots(i):
+    id = i['instanceId']
+    print('creating snapshots for instance {}'.format(id))
+    response = ec2.create_snapshots(
+        Description=f'{id} EBS Volume Snapshots',
+        InstanceSpecification={
+            'InstanceId': id,
+            'ExcludeBootVolume': False,
+        }
     )
-    if not state['StoppingInstances'][0]['CurrentState']['Code'] in [64,80]:
-       print('Not Stopped')
-       sys.exit(1)
-    response = find_volumes(instance_id)
-    return response
+    ids = []
+    for j in range(0, len(response['Snapshots'])):
+        ids.append(response['Snapshots'][j]['SnapshotId'])
 
-def create_image(instance_id):
-    instance = EC2_RESOURCE.Instance(instance_id)
-    generate_keys = random.randint(1, 100)
-    image = instance.create_image(
-        Name='AMI-image-created-by-automation' + '-' + instance_id +'-'+ str(generate_keys),
-        Description='This is the AMI for:' + instance_id +'-'+ str(generate_keys),
-        NoReboot=True
-    )
-    print(f'AMI creation started: {image.id}')
-    print('This process might take a while depending on the size of the volumes')
+    for df1 in i['volumes']:
+        for df2 in response['Snapshots']:
+            if df1['volumeId'] == df2['VolumeId']:
+                df1.update({"snapshotId": df2['SnapshotId']})
 
-    image.wait_until_exists(
+    snapshot_create_waiter.wait(
         Filters=[
             {
-                'Name': 'state',
-                'Values': ['available']
-            }
-        ]
+                'Name': 'status',
+                'Values': [
+                    'completed',
+                ]
+            },
+        ],
+        SnapshotIds=ids,
+        WaiterConfig={
+            'Delay': 10,
+            'MaxAttempts': 40
+        }
     )
-    print(f'AMI {image.id} successfully created')
+    return i
 
-def create_snapshot(volume_ids, instance_id):
-    response = []
-    for item in volume_ids:
-        snapshot = EC2_RESOURCE.create_snapshot(
-            VolumeId=item['volume'],
-            TagSpecifications=[
+
+def create_volume(i):
+    id = i['instanceId']
+    print('creating volumes for instance {}'.format(id))
+    volumeIDs = []
+    for v in i['volumes']:
+        response = ec2.create_volume(
+            AvailabilityZone=v['zone'],
+            Encrypted=True,
+            KmsKeyId='',
+            Iops=v['iops'],
+            Size=v['size'],
+            SnapshotId=v['snapshotId'],
+            VolumeType=v['volumeType']
+        )
+        id = response['Attachments'][0]['VolumeId']
+        volumeIDs.append(id)
+        v.update({"newVolumeId": id})
+
+    volume_waiter.wait(
+        Filters=[
+            {
+                'Name': 'status',
+                'Values': [
+                    'available',
+                ]
+            },
+        ],
+        VolumeIds=volumeIDs,
+        WaiterConfig={
+            'Delay': 5,
+            'MaxAttempts': 40
+        }
+    )
+
+    return i
+
+
+def detach_volumes(i):
+    id = i['instanceId']
+    volumes = i['volumes']
+    print('detaching old volumes for instance {}'.format(id))
+    for j in range(0, len(volumes)):
+        ec2.detach_volume(
+            Force=True,
+            InstanceId=id,
+            VolumeId=volumes[j]['volumeId']
+        )
+        volume_waiter.wait(
+            Filters=[
                 {
-                    'ResourceType': 'snapshot',
-                    'Tags': [
-                        {
-                            'Key': 'Name',
-                            'Value': 'Snapshot created for1: ' + item['volume'] + '-' + instance_id
-                        },
+                    'Name': 'status',
+                    'Values': [
+                        'available',
                     ]
                 },
-            ]
+            ],
+            VolumeIds=volumes[j]['volumeId'],
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 40
+            }
         )
-        print(f'Creating Snapshot {snapshot.id} for volume {item}')
-        response.append({"snapshot": snapshot.id, "volume": item['volume'], "type": item['type'], "az": item['az'], 'device': item['device']})
-        time.sleep(60)
+        # ec2.delete_volume(VolumeId=volumes[i])
+    return
+
+
+def attach_volumes(i):
+    id = i['instanceId']
+    volumes = i['volumes']
+    print('attaching new volumes for instance {}'.format(id))
+    for j in volumes:
+        response = ec2.attach_volume(
+            Device='string',
+            InstanceId=id,
+            VolumeId=j['newVolumeId']
+        )
+    return
+
+
+def volume_process(i):
+    snapshots = create_snapshots(i)
+    volumeIds = create_volume(snapshots)
+    detach_volumes(volumeIds)
+    attach_volumes(volumeIds)
+
+    return volumeIds
+
+
+def main(List):
+    for i in List:
+        id = i['instanceId']
+        stop_instance(id)
+        instance_stop_waiter.wait(
+            Filters=[
+                {
+                    'Name': 'instance-state-name',
+                    'Values': [
+                        'stopped',
+                    ]
+                },
+            ],
+            InstanceIds=[id],
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 10
+            }
+        )
+        response = volume_process(i)
+        print('starting instance {}'.format(id))
+        ec2.start_instances(InstanceIds=[id])
+
     return response
 
-def create_volume(snapshots, instance_id):
-    response = []
-    for item in snapshots:
-        print('Creating Volume(s)')
-        volume = EC2_CLIENT.create_volume(
-            AvailabilityZone=item['az'],
-            Encrypted=True,
-            KmsKeyId= 'kms_key'
-            SnapshotId=item['snapshot'],
-            VolumeType=item['type'],
-        )
-        
-        key = {'volume': volume['VolumeId'], "type": item['type'], 'device': item['device']}
-        print(key)
-        response.append(key)
-    time.sleep(20)
-    return response
 
-def detach_volume(instance_id, volume_ids):
-    # EC2_RESOURCE.Instance(INSTANCE_ID).stop()
-    # time.sleep(15)
-    for item in volume_ids:
-        print("Detaching unencrypted Volume(s)")
-        response = EC2_CLIENT.detach_volume(
-            Force=False,
-            InstanceId=instance_id,
-            VolumeId= item['volume']
-            # DryRun=True
-        )
-        time.sleep(20)
+if __name__ == "__main__":
+    l = []
+    res = ec2.describe_volumes(
+        Filters=[
+            {
+                'Name': 'encrypted',
+                'Values': [
+                    "false",
+                ]
+            },
+        ]
+    )
+    volumes = res['Volumes']
+    for i in range(0, len(volumes)):
+        for j in range(0, len(volumes[i]['Attachments'])):
+            List = {}
+            List['zone'] = volumes[i]['AvailabilityZone']
+            List['size'] = volumes[i]['Size']
+            List['iops'] = volumes[i]['Iops']
+            List['volumeType'] = volumes[i]['VolumeType']
+            List['instanceId'] = volumes[i]['Attachments'][j]['InstanceId']
+            List['volumeId'] = volumes[i]['Attachments'][j]['VolumeId']
+            List['device'] = volumes[i]['Attachments'][j]['Device']
+            l.append(List)
 
-def attach_volume(instance_id, new_volume_ids):
-    for item in new_volume_ids:
-        print("Attaching new encrypted Volume")
-        response = EC2_CLIENT.attach_volume(
-            Device = item['device'],
-            InstanceId=instance_id,
-            VolumeId= item['volume']
-            # DryRun=True
-        )
-        time.sleep(20)
-    EC2_RESOURCE.Instance(instance_id).start()
-
-volume_ids = stop_instances(INSTANCE_ID)
-create_image(INSTANCE_ID)
-snapshots = create_snapshot(volume_ids,INSTANCE_ID)
-new_volume_ids = create_volume(snapshots,INSTANCE_ID)
-detach_volume(INSTANCE_ID, volume_ids)
-attach_volume(INSTANCE_ID, new_volume_ids)
+    # Get all unique values of key 'instanceId'.
+    instances = list(set(i['instanceId'] for i in l))
+    newList = []
+    for m in instances:
+        new = {}
+        new['instanceId'] = m
+        new['volumes'] = []
+        for k in l:
+            if k['instanceId'] == m:
+                vol = {}
+                vol['zone'] = k['zone']
+                vol['size'] = k['size']
+                vol['iops'] = k['iops']
+                vol['volumeType'] = k['volumeType']
+                vol['volumeId'] = k['volumeId']
+                vol['device'] = k['device']
+                new['volumes'].append(vol)
+        newList.append(new)
+    results = main(newList)
+    
+    
